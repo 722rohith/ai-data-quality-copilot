@@ -1,5 +1,6 @@
-"""Data-quality engine: profiling, hidden-null detection, rules, schema drift,
-ETL log parsing and a cleaning plan that yields Pandas code, SQL and a cleaned DataFrame."""
+"""Data-quality engine: profiling, hidden-null detection, rules, schema + distribution drift,
+ETL log parsing and a reviewable cleaning plan that yields Pandas code, SQL and a cleaned DataFrame."""
+import json
 import re
 import numpy as np
 import pandas as pd
@@ -11,6 +12,10 @@ ID_TOKENS = {"id", "identifier", "code", "key", "year", "zip", "pin", "phone", "
 POSITIVE_PREFIX = ("weight", "price", "amount", "quant", "visib", "salary",
                    "cost", "revenue", "sales", "height", "mrp")
 POSITIVE_EXACT = {"age", "qty", "amt"}
+
+# A label that differs from another only by one of these is a DIFFERENT category
+# (e.g. "Dollars" vs "Dollars (millions)"), never a spelling variant.
+_SCALE = re.compile(r"million|billion|thousand|trillion|percent|\bpct\b|\bbn\b|\bmn\b|[%$€£]", re.I)
 
 
 def _tokens(name):
@@ -38,28 +43,48 @@ def _is_text(s):
 
 
 def _label_groups(values):
-    """Group labels that are likely the same category written differently."""
+    """Find labels that are likely the same category written differently.
+
+    Returns (groups, conflicts):
+      groups    -> list of (set_of_labels, confidence) where confidence is
+                   "high"   (only case / spacing / _ / - differ -> safe to auto-merge) or
+                   "review" (prefix or initials match -> a human must confirm)
+      conflicts -> pairs that look similar but differ by a scale/unit word
+                   (e.g. 'Dollars' vs 'Dollars (millions)'); NEVER merged.
+    """
     norm = {}
     for v in values:
         norm.setdefault(re.sub(r"[\s_\-]+", " ", v.strip().lower()), []).append(v)
     keys = list(norm)
-    groups = [set(g) for g in norm.values() if len(g) > 1]
+    groups = [(set(g), "high") for g in norm.values() if len(g) > 1]
+    conflicts = []
     for a in keys:
         for b in keys:
-            if a != b and len(a) < len(b):
-                words = b.split()
-                if (len(words) > 1 and a == "".join(w[0] for w in words)) or \
-                        (len(a) >= 3 and b.startswith(a)):
-                    groups.append(set(norm[a]) | set(norm[b]))
+            if a == b or len(a) >= len(b):
+                continue
+            words = b.split()
+            abbrev = len(words) > 1 and a == "".join(w[0] for w in words)
+            prefix = len(a) >= 3 and b.startswith(a)
+            if prefix:
+                extra = b[len(a):]
+                if _SCALE.search(extra):
+                    conflicts.append((sorted(norm[a])[0], sorted(norm[b])[0]))
+                    continue
+                if re.search(r"\d", extra):      # 'Level 1' vs 'Level 10' etc.
+                    continue
+            if abbrev or prefix:
+                groups.append((set(norm[a]) | set(norm[b]), "review"))
     merged = []
-    for g in groups:
+    for g, conf in groups:
         for m in merged:
-            if m & g:
-                m |= g
+            if m[0] & g:
+                m[0].update(g)
+                if conf == "review":
+                    m[1] = "review"
                 break
         else:
-            merged.append(set(g))
-    return merged
+            merged.append([set(g), conf])
+    return [(s, c) for s, c in merged], conflicts
 
 
 # ----------------------------------------------------------------------
@@ -74,7 +99,8 @@ def profile_dataframe(df):
                 "unique": int(s.nunique(dropna=True)), "hidden_nulls": 0,
                 "hidden_tokens": [], "invalid_zeros": 0, "outliers": 0,
                 "numeric_text": False, "bad_numeric_text": 0,
-                "label_groups": [], "nonstandard_rows": 0, "id_like": False}
+                "label_groups": [], "label_review": [], "scale_conflicts": [],
+                "nonstandard_rows": 0, "review_rows": 0, "id_like": False}
         info["missing_pct"] = round(info["missing"] / n * 100, 2) if n else 0.0
 
         if _is_text(s):
@@ -89,11 +115,30 @@ def profile_dataframe(df):
                 info["bad_numeric_text"] = int(num.isna().sum())
             elif 1 < clean.nunique() <= 30:
                 counts = clean.value_counts()
-                for g in _label_groups(counts.index.tolist()):
-                    canon = max(g, key=lambda v: counts.get(v, 0))
-                    variants = sorted(g - {canon})
-                    info["label_groups"].append({"canonical": canon, "variants": variants})
-                    info["nonstandard_rows"] += int(sum(counts.get(v, 0) for v in variants))
+                groups, conflicts = _label_groups(counts.index.tolist())
+                for members, conf in groups:
+                    # Split by normalised spelling: case/spacing-only differences are always safe;
+                    # only merging *across* different spellings needs a human decision.
+                    sub = {}
+                    for v in members:
+                        sub.setdefault(re.sub(r"[\s_\-]+", " ", v.strip().lower()), []).append(v)
+                    reps = []
+                    for vs in sub.values():
+                        rep = max(vs, key=lambda v: counts.get(v, 0))
+                        reps.append(rep)
+                        extra = sorted(set(vs) - {rep})
+                        if extra:
+                            info["label_groups"].append({"canonical": rep, "variants": extra})
+                            info["nonstandard_rows"] += int(sum(counts.get(v, 0) for v in extra))
+                    if len(sub) > 1:
+                        total = {k: sum(counts.get(x, 0) for x in vs) for k, vs in sub.items()}
+                        top_key = max(total, key=total.get)
+                        canon = max(sub[top_key], key=lambda v: counts.get(v, 0))
+                        # every spelling of the other sub-groups maps straight to the canonical label
+                        variants = sorted(x for k, vs in sub.items() if k != top_key for x in vs)
+                        info["label_review"].append({"canonical": canon, "variants": variants})
+                        info["review_rows"] += int(sum(counts.get(x, 0) for x in variants))
+                info["scale_conflicts"] = conflicts[:5]
         elif is_numeric_dtype(s) and not is_bool_dtype(s):
             info["id_like"] = is_id_like(c, s)
             nn = s.dropna()
@@ -109,7 +154,6 @@ def profile_dataframe(df):
     prof = {"rows": n, "columns_count": len(df.columns),
             "duplicates": int(df.duplicated().sum()),
             "missing_cells": int(df.isna().sum().sum()), "columns": cols}
-    # keys kept for backward compatibility with the old analyze_root_cause()
     prof["total_rows"] = n
     prof["duplicate_rows"] = prof["duplicates"]
     prof["missing_percentage"] = {c: i["missing_pct"] for c, i in cols.items()}
@@ -117,9 +161,16 @@ def profile_dataframe(df):
     return prof
 
 
+def hidden_total(prof):
+    """Cells that look filled in but are placeholders, invalid, or high-confidence label variants."""
+    return sum(i["hidden_nulls"] + i["invalid_zeros"] + i["nonstandard_rows"] + i["bad_numeric_text"]
+               for i in prof["columns"].values())
+
+
 def quality_score(prof):
     """Honest score: average gaps + duplicates + invalid values + a penalty for
-    every column with more than 5% missing, so one bad column cannot hide."""
+    every column with more than 5% missing, so one bad column cannot hide.
+    'Review' label groups are not penalised: they are not confirmed errors."""
     n = max(prof["rows"], 1)
     cols = prof["columns"].values()
     k = max(len(prof["columns"]), 1)
@@ -175,21 +226,81 @@ def evaluate_rule(df, rule):
             "pct": round(failed / max(len(df), 1) * 100, 2), "note": ""}
 
 
-def default_rules(df, prof):
+def default_rules(df, prof, max_rules=30):
+    """Pre-filled rules: completeness for problem/key columns, sensible numeric bounds,
+    and allowed-value lists for low-cardinality text columns (guards against future bad loads)."""
     rules = []
     for c, i in prof["columns"].items():
-        if i["missing_pct"] > 0:
+        s = df[c]
+        toks = _tokens(c)
+        keyish = i["id_like"] or i["unique"] <= 30 or "code" in toks or "year" in toks
+        if i["missing_pct"] > 0 or keyish:
             rules.append({"column": c, "op": "not_null", "value": ""})
-        if i["dtype"] != "object" and expects_positive(c) and not i["id_like"]:
-            rules.append({"column": c, "op": ">", "value": "0"})
-    return rules
+        if is_numeric_dtype(s) and not is_bool_dtype(s):
+            if "year" in toks:
+                rules.append({"column": c, "op": "between", "value": "1900,2100"})
+            elif expects_positive(c) and not i["id_like"]:
+                rules.append({"column": c, "op": ">", "value": "0"})
+        elif _is_text(s) and 2 <= i["unique"] <= 15:
+            vals = [str(v) for v in s.dropna().unique() if str(v).strip().lower() not in NULL_TOKENS]
+            if vals and not any("," in v for v in vals):
+                rules.append({"column": c, "op": "in_set", "value": ",".join(sorted(vals))})
+    return rules[:max_rules]
+
+
+def rules_to_great_expectations(rule_list, suite_name="data_quality_suite"):
+    """Export the current rules as a Great Expectations expectation-suite JSON string."""
+    exps = []
+    for r in rule_list:
+        col, op, val = r["column"], r["op"], str(r.get("value", "") or "").strip()
+        try:
+            if op == "not_null":
+                e = ("expect_column_values_to_not_be_null", {"column": col})
+            elif op == "unique":
+                e = ("expect_column_values_to_be_unique", {"column": col})
+            elif op in (">", ">="):
+                e = ("expect_column_values_to_be_between",
+                     {"column": col, "min_value": float(val), "strict_min": op == ">"})
+            elif op in ("<", "<="):
+                e = ("expect_column_values_to_be_between",
+                     {"column": col, "max_value": float(val), "strict_max": op == "<"})
+            elif op == "between":
+                lo, hi = [float(t) for t in val.split(",")]
+                e = ("expect_column_values_to_be_between", {"column": col, "min_value": lo, "max_value": hi})
+            elif op == "in_set":
+                e = ("expect_column_values_to_be_in_set",
+                     {"column": col, "value_set": [t.strip() for t in val.split(",")]})
+            elif op == "regex":
+                e = ("expect_column_values_to_match_regex", {"column": col, "regex": val})
+            else:
+                continue
+        except ValueError:
+            continue
+        exps.append({"expectation_type": e[0], "kwargs": e[1], "meta": {}})
+    return json.dumps({"expectation_suite_name": suite_name, "expectations": exps, "meta": {}}, indent=2)
 
 
 # ----------------------------------------------------------------------
-# SCHEMA DRIFT
+# DRIFT (schema + distribution)
 # ----------------------------------------------------------------------
+def _psi(base, cur, bins=10):
+    """Population Stability Index. <0.1 stable, 0.1-0.25 moderate, >0.25 significant."""
+    b = pd.to_numeric(base, errors="coerce").dropna()
+    c = pd.to_numeric(cur, errors="coerce").dropna()
+    if len(b) < 30 or len(c) < 30 or b.nunique() < 2:
+        return None
+    edges = np.unique(np.quantile(b, np.linspace(0, 1, bins + 1))).astype(float)
+    if len(edges) < 3:
+        return None
+    edges[0], edges[-1] = -np.inf, np.inf
+    pb = np.clip(np.histogram(b, edges)[0] / len(b), 1e-4, None)
+    pc = np.clip(np.histogram(c, edges)[0] / len(c), 1e-4, None)
+    return float(np.sum((pc - pb) * np.log(pc / pb)))
+
+
 def detect_drift(df, baseline):
-    out = {"added": [], "removed": [], "dtype_changed": [], "has_baseline": baseline is not None}
+    out = {"added": [], "removed": [], "dtype_changed": [], "numeric_shift": [],
+           "category_shift": [], "has_baseline": baseline is not None}
     if baseline is None:
         return out
     cur, base = set(df.columns), set(baseline.columns)
@@ -199,6 +310,22 @@ def detect_drift(df, baseline):
         if str(df[c].dtype) != str(baseline[c].dtype):
             out["dtype_changed"].append({"column": c, "was": str(baseline[c].dtype),
                                          "now": str(df[c].dtype)})
+        if is_numeric_dtype(df[c]) and is_numeric_dtype(baseline[c]) and not is_id_like(c, df[c]):
+            psi = _psi(baseline[c], df[c])
+            if psi is not None and psi >= 0.1:
+                out["numeric_shift"].append({"column": c, "psi": round(psi, 3),
+                                             "level": "significant" if psi >= 0.25 else "moderate"})
+        elif _is_text(df[c]) and _is_text(baseline[c]):
+            if df[c].nunique() <= 50 and baseline[c].nunique() <= 50:
+                pb = baseline[c].astype(str).value_counts(normalize=True)
+                pc = df[c].astype(str).value_counts(normalize=True)
+                idx = pb.index.union(pc.index)
+                tvd = float(0.5 * (pc.reindex(idx, fill_value=0) - pb.reindex(idx, fill_value=0)).abs().sum())
+                new_vals = sorted(set(pc.index) - set(pb.index))[:5]
+                gone_vals = sorted(set(pb.index) - set(pc.index))[:5]
+                if tvd >= 0.1 or new_vals or gone_vals:
+                    out["category_shift"].append({"column": c, "tvd": round(tvd, 3),
+                                                  "new_values": new_vals, "missing_values": gone_vals})
     return out
 
 
@@ -251,7 +378,7 @@ def analyze_logs(text, columns=()):
 
 
 # ----------------------------------------------------------------------
-# CLEANING PLAN  ->  pandas code / SQL / cleaned dataframe
+# CLEANING PLAN  ->  reviewable steps -> pandas code / SQL / cleaned dataframe
 # ----------------------------------------------------------------------
 def _best_predictor(df, col, numeric):
     y = df[col]
@@ -291,7 +418,8 @@ def _best_predictor(df, col, numeric):
 def build_plan(df, prof):
     cols = prof["columns"]
     plan = {"drop_duplicates": prof["duplicates"] > 0, "hidden_null_cols": {},
-            "to_numeric": [], "label_maps": {}, "zero_cols": [], "impute": [], "cap": []}
+            "to_numeric": [], "label_maps": {}, "label_review": {},
+            "zero_cols": [], "impute": [], "cap": []}
     for c, i in cols.items():
         if i["hidden_nulls"]:
             plan["hidden_null_cols"][c] = i["hidden_tokens"]
@@ -299,11 +427,13 @@ def build_plan(df, prof):
             plan["to_numeric"].append(c)
         if i["label_groups"]:
             plan["label_maps"][c] = {v: g["canonical"] for g in i["label_groups"] for v in g["variants"]}
+        if i["label_review"]:
+            plan["label_review"][c] = {v: g["canonical"] for g in i["label_review"] for v in g["variants"]}
         if i["invalid_zeros"]:
             plan["zero_cols"].append(c)
         if i["outliers"]:
             plan["cap"].append(c)
-    work = df.copy()  # only used to look for imputation predictors on the repaired data
+    work = df.copy()
     for c, toks in plan["hidden_null_cols"].items():
         work[c] = work[c].where(~work[c].astype(str).str.strip().isin(toks))
     for c in plan["to_numeric"]:
@@ -318,6 +448,63 @@ def build_plan(df, prof):
             plan["impute"].append({"col": c, "numeric": bool(numeric),
                                    "by": _best_predictor(work, c, numeric)})
     return plan
+
+
+def plan_steps(plan, prof):
+    """Flat, human-reviewable list of every fix. Risky ones default to unapproved."""
+    cols = prof["columns"]
+    steps = []
+
+    def add(id_, fix, col, detail, rows, default=True):
+        steps.append({"id": id_, "fix": fix, "column": col, "detail": detail[:140],
+                      "rows": int(rows), "default": default})
+
+    if plan["drop_duplicates"]:
+        add("dup", "Remove duplicates", "(all)", "Drop exact duplicate rows", prof["duplicates"])
+    for c, toks in plan["hidden_null_cols"].items():
+        add(f"hidden:{c}", "Hidden nulls -> NULL", c, f"Replace {toks} with NULL", cols[c]["hidden_nulls"])
+    for c in plan["to_numeric"]:
+        add(f"numeric:{c}", "Text -> number", c, "Convert to numeric; unparseable values become NULL",
+            cols[c]["bad_numeric_text"])
+    for c, m in plan["label_maps"].items():
+        add(f"labels:{c}", "Merge label spellings", c, "; ".join(f"'{v}' -> '{k}'" for v, k in m.items()),
+            cols[c]["nonstandard_rows"])
+    for c, m in plan.get("label_review", {}).items():
+        add(f"labels_review:{c}", "Merge POSSIBLE variants (review)", c,
+            "; ".join(f"'{v}' -> '{k}'" for v, k in m.items()), cols[c]["review_rows"], default=False)
+    for c in plan["zero_cols"]:
+        add(f"zero:{c}", "Invalid zeros -> NULL", c, "0 / negative is not valid for this field",
+            cols[c]["invalid_zeros"])
+    for s in plan["impute"]:
+        c = s["col"]
+        how = (f"Fill from {s['by']['by']} ({s['by']['strength']:.0%} explained)" if s["by"]
+               else ("Fill with median" if s["numeric"] else "Fill with 'Not Specified'"))
+        add(f"impute:{c}", "Fill missing values", c, how,
+            cols[c]["missing"] + cols[c]["hidden_nulls"] + cols[c]["invalid_zeros"])
+    for c in plan["cap"]:
+        add(f"cap:{c}", "Cap outliers (IQR)", c, "Clip to 1.5xIQR; some outliers may be genuine",
+            cols[c]["outliers"], default=False)
+    return steps
+
+
+def filter_plan(plan, approved):
+    """Return a plan containing only the approved steps."""
+    ok = set(approved)
+    p = {
+        "drop_duplicates": bool(plan["drop_duplicates"] and "dup" in ok),
+        "hidden_null_cols": {c: t for c, t in plan["hidden_null_cols"].items() if f"hidden:{c}" in ok},
+        "to_numeric": [c for c in plan["to_numeric"] if f"numeric:{c}" in ok],
+        "label_maps": {c: dict(m) for c, m in plan["label_maps"].items() if f"labels:{c}" in ok},
+        "label_review": {c: m for c, m in plan.get("label_review", {}).items()
+                         if f"labels_review:{c}" not in ok},      # still pending review
+        "zero_cols": [c for c in plan["zero_cols"] if f"zero:{c}" in ok],
+        "impute": [s for s in plan["impute"] if f"impute:{s['col']}" in ok],
+        "cap": [c for c in plan["cap"] if f"cap:{c}" in ok],
+    }
+    for c, m in plan.get("label_review", {}).items():
+        if f"labels_review:{c}" in ok:
+            p["label_maps"].setdefault(c, {}).update(m)
+    return p
 
 
 def apply_plan(df, plan):
@@ -353,6 +540,7 @@ def apply_plan(df, plan):
 def plan_to_pandas(plan):
     L = ["import pandas as pd", "import numpy as np", "",
          "def clean_dataset(df):", "    d = df.copy()"]
+    n0 = len(L)
     if plan["drop_duplicates"]:
         L += ["    # 1. remove exact duplicate rows", "    d = d.drop_duplicates()"]
     for c, toks in plan["hidden_null_cols"].items():
@@ -379,6 +567,8 @@ def plan_to_pandas(plan):
     for c in plan["cap"]:
         L += [f"    q1, q3 = d[{c!r}].quantile(.25), d[{c!r}].quantile(.75)",
               f"    d[{c!r}] = d[{c!r}].clip(q1 - 1.5*(q3-q1), q3 + 1.5*(q3-q1))  # cap outliers in {c}"]
+    if len(L) == n0:
+        L.append("    # no approved fixes: dataset is returned unchanged")
     L.append("    return d")
     return "\n".join(L)
 
@@ -414,4 +604,4 @@ def plan_to_sql(plan, table="your_table"):
     for c in plan["cap"]:
         q.append(f"-- cap outliers in {c}: compute Q1/Q3 with PERCENTILE_CONT(0.25/0.75), then "
                  f"SELECT LEAST(GREATEST({c}, q1-1.5*(q3-q1)), q3+1.5*(q3-q1))")
-    return "\n".join(q) if q else "-- no SQL fixes needed"
+    return "\n".join(q) if q else "-- no approved SQL fixes"

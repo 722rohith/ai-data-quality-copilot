@@ -1,5 +1,6 @@
-"""Interactive Q&A over the analysis. Uses Hugging Face (HUGGINGFACEHUB_API_TOKEN) or Claude (ANTHROPIC_API_KEY)
-(only stats and log excerpts are sent, never the raw rows); otherwise a local fallback."""
+"""Interactive Q&A over the analysis. Uses Gemini (GEMINI_API_KEY), Hugging Face (HUGGINGFACEHUB_API_TOKEN)
+or Claude (ANTHROPIC_API_KEY). Only statistics, category labels and log excerpts are sent, never the raw rows;
+otherwise a local rule-based fallback answers from the analysis itself."""
 import json
 import os
 
@@ -10,27 +11,117 @@ except ImportError:
     pass
 
 SYSTEM = ("You are a data-quality copilot for data engineers and business users. Answer using ONLY the "
-          "JSON context (profile, rule results, schema drift, log findings, cleaning plan). Be concise and "
+          "JSON context (profile, rule results, drift, log findings, cleaning steps). Be concise and "
           "write in plain business language. NEVER mention JSON field names or internal keys such as "
-          "'strength', 'by', 'impute', 'plan' or 'label_groups'; say things like 'Outlet_Identifier explains "
-          "almost all of it' instead. Give Python or SQL only when asked. Treat root causes as likely "
-          "explanations, not facts, and say when the context does not contain the answer.")
+          "'strength', 'by', 'impute', 'plan', 'label_groups' or 'KEY_FINDINGS'; say things like "
+          "'Outlet_Identifier explains almost all of it' instead. Give Python or SQL only when asked. "
+          "Treat root causes as likely explanations, not facts, and say when the context does not contain the answer.\n"
+          "Important rules:\n"
+          "1. Labels that differ only by a unit or scale word (for example 'Dollars' vs 'Dollars (millions)', "
+          "'%' vs 'percent', 'thousands' vs 'millions') are DIFFERENT units, not spelling variants. Never suggest "
+          "merging or replacing one with the other; suggest converting values explicitly or splitting the column, "
+          "and confirming with the data owner.\n"
+          "2. Possible label variants waiting for review are NOT confirmed errors; say a person must confirm them.\n"
+          "3. Only describe a fix as applied if it is marked approved in the cleaning steps; otherwise call it "
+          "proposed or pending.\n"
+          "4. For drift, explain what moved versus the baseline (schema, numeric distribution, category shares) "
+          "and give likely causes as hypotheses.")
 
 
+# ----------------------------------------------------------------------
+# helpers that read the analysis context
+# ----------------------------------------------------------------------
+def _drift_text(drift):
+    if not drift or not drift.get("has_baseline"):
+        return "No baseline file was uploaded, so no drift check was done."
+    bits = []
+    if drift.get("added"):
+        bits.append(f"new columns {drift['added']}")
+    if drift.get("removed"):
+        bits.append(f"columns missing vs baseline {drift['removed']}")
+    for d in drift.get("dtype_changed", []):
+        bits.append(f"{d['column']} changed type {d['was']} -> {d['now']}")
+    for d in drift.get("numeric_shift", []):
+        bits.append(f"{d['column']} values shifted ({d['level']}, PSI {d['psi']})")
+    for d in drift.get("category_shift", []):
+        extra = f", new values {d['new_values']}" if d.get("new_values") else ""
+        bits.append(f"{d['column']} category mix moved {d['tvd'] * 100:.0f}%{extra}")
+    return "Compared with the baseline: " + "; ".join(bits) + "." if bits else \
+        "No drift: schema and value distributions match the baseline."
+
+
+def _steps_text(ctx):
+    steps = ctx.get("steps") or []
+    if not steps:
+        return "No cleaning steps were proposed."
+    ok = [s for s in steps if s.get("approved")]
+    pend = [s for s in steps if not s.get("approved")]
+    out = []
+    if ok:
+        out.append("Approved: " + "; ".join(f"{s['fix']} ({s['column']})" for s in ok) + ".")
+    if pend:
+        out.append("Not applied yet (needs your tick in the review table): "
+                   + "; ".join(f"{s['fix']} ({s['column']})" for s in pend) + ".")
+    return " ".join(out)
+
+
+def _summary(ctx):
+    """Small, high-signal digest placed FIRST in the prompt so truncation never drops it."""
+    cols = ctx["profile"]["columns"]
+    return {
+        "score": ctx["profile"]["score"],
+        "mixed_unit_labels_do_not_merge": {c: i["scale_conflicts"] for c, i in cols.items()
+                                           if i.get("scale_conflicts")},
+        "possible_label_variants_need_review": {c: i["label_review"] for c, i in cols.items()
+                                                if i.get("label_review")},
+        "columns_with_problems": {c: {k: i[k] for k in ("missing_pct", "hidden_nulls", "invalid_zeros", "outliers")
+                                      if i.get(k)} for c, i in cols.items()
+                                  if i["missing"] or i["hidden_nulls"] or i["invalid_zeros"]},
+        "drift": _drift_text(ctx.get("drift")),
+        "cleaning_steps": ctx.get("steps", []),
+    }
+
+
+def _compact(ctx, limit=8000):
+    """Stats only (no raw rows), compact JSON, summary first, trimmed so small models can read it."""
+    payload = {"KEY_FINDINGS": _summary(ctx), **{k: v for k, v in ctx.items() if k != "steps"}}
+    return json.dumps(payload, default=str, separators=(",", ":"))[:limit]
+
+
+# ----------------------------------------------------------------------
+# local (no-AI) answers
+# ----------------------------------------------------------------------
 def _local(question, ctx):
     """Rule-based answers built from the analysis itself (works with no AI model)."""
     from src.dq_engine import plan_to_pandas, plan_to_sql
     from src.report import _root_causes, _prevention
     q = question.lower()
     prof, plan = ctx["profile"], ctx["plan"]
-    hit = [c for c in prof["columns"] if c.lower() in q]
+    cols = prof["columns"]
+    hit = [c for c in cols if c.lower() in q]
 
     def pick(text):
         keep = [l for l in text.splitlines() if any(c in l for c in hit)] if hit else []
         return "\n".join(keep) or text
 
+    if any(k in q for k in ("drift", "baseline", "schema")):
+        return _drift_text(ctx.get("drift"))
+    if any(k in q for k in ("scale", "million", "merge", "convert", "dollars")) or (hit and any(
+            cols[c].get("scale_conflicts") for c in hit) and any(k in q for k in ("why", "flag", "warn"))):
+        mixed = {c: i["scale_conflicts"] for c, i in cols.items() if i.get("scale_conflicts")}
+        if mixed:
+            return "\n".join(
+                f"**{c}**: '{a}' and '{b}' differ by a unit/scale word, so they are most likely different "
+                f"units, not typos. Do not merge them. Convert the values explicitly (or split the column) and "
+                f"confirm with the data owner which rows use which unit."
+                for c, pairs in mixed.items() for a, b in pairs[:2])
+    if any(k in q for k in ("review", "approve", "pending", "apply", "applied")):
+        return _steps_text(ctx)
     if "sql" in q:
-        return "```sql\n" + pick(plan_to_sql(plan)) + "\n```"
+        sql = pick(plan_to_sql(plan))
+        note = "\n\n_No fixes are approved yet. Tick them in the review table to generate SQL._" \
+            if sql.startswith("-- no approved") else ""
+        return "```sql\n" + sql + "\n```" + note
     if any(k in q for k in ("python", "pandas", "code", "script")):
         return "```python\n" + pick(plan_to_pandas(plan)) + "\n```"
     if any(k in q for k in ("why", "cause", "reason", "root")):
@@ -56,7 +147,11 @@ def _facts(question, ctx):
             if i["invalid_zeros"]:
                 facts.append(f"{i['invalid_zeros']:,} zero/negative values")
             for g in i["label_groups"]:
-                facts.append(f"labels {g['variants']} should be '{g['canonical']}'")
+                facts.append(f"labels {g['variants']} differ from '{g['canonical']}' only by case/spacing")
+            for g in i.get("label_review", []):
+                facts.append(f"labels {g['variants']} may be variants of '{g['canonical']}' (needs your review)")
+            for a, b in i.get("scale_conflicts", []):
+                facts.append(f"'{a}' vs '{b}' look like different units (do not merge)")
             if i["outliers"]:
                 facts.append(f"{i['outliers']:,} outliers")
             step = next((s for s in ctx["plan"]["impute"] if s["col"] == c), None)
@@ -73,15 +168,13 @@ def _facts(question, ctx):
         lg = ctx["logs"]
         return "No logs uploaded." if not lg["provided"] else f"Log categories: {json.dumps(lg['categories'])[:1500]}"
     worst = sorted(cols.items(), key=lambda kv: -kv[1]["missing_pct"])[:3]
-    return ("Local mode (set HUGGINGFACEHUB_API_TOKEN in .env for full AI answers). Worst columns by missing %: "
-            + ", ".join(f"{c} {i['missing_pct']}%" for c, i in worst))
+    return ("Local mode (set GEMINI_API_KEY or HUGGINGFACEHUB_API_TOKEN in .env for full AI answers). "
+            "Worst columns by missing %: " + ", ".join(f"{c} {i['missing_pct']}%" for c, i in worst))
 
 
-def _compact(ctx, limit=8000):
-    """Stats only (no raw rows), compact JSON, trimmed so small models can read it."""
-    return json.dumps(ctx, default=str, separators=(",", ":"))[:limit]
-
-
+# ----------------------------------------------------------------------
+# AI back-ends
+# ----------------------------------------------------------------------
 FALLBACK_MODELS = ["meta-llama/Llama-3.2-3B-Instruct", "Qwen/Qwen2.5-7B-Instruct",
                    "HuggingFaceTB/SmolLM3-3B", "Qwen/Qwen2.5-72B-Instruct"]
 
@@ -182,7 +275,7 @@ def answer(question, ctx, history):
             msgs.append({"role": "user", "content": question})
             r = client.messages.create(
                 model=os.getenv("DQ_MODEL", "claude-sonnet-5-5"), max_tokens=900,
-                system=SYSTEM + "\n\nContext JSON:\n" + json.dumps(ctx, default=str)[:15000],
+                system=SYSTEM + "\n\nContext JSON:\n" + _compact(ctx, 15000),
                 messages=msgs)
             return r.content[0].text, "Claude"
         except Exception as e:

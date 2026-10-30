@@ -1,10 +1,12 @@
+import io
 import json
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
 
 from src.dq_engine import (profile_dataframe, default_rules, evaluate_rule, RULE_OPS,
-                         detect_drift, analyze_logs, build_plan, apply_plan)
+                           detect_drift, analyze_logs, build_plan, apply_plan,
+                           plan_steps, filter_plan, hidden_total, rules_to_great_expectations)
 from src.report import build_report
 from src.llm import answer as ask_copilot
 
@@ -15,7 +17,12 @@ try:
 except ImportError:
     HAS_PLOTLY = False
 
-# Set page config
+try:
+    import markdown as md_lib
+    HAS_MARKDOWN = True
+except ImportError:
+    HAS_MARKDOWN = False
+
 st.set_page_config(
     page_title="AI Data Quality & Root-Cause Copilot",
     page_icon="📋",
@@ -206,8 +213,55 @@ def style_fig(fig):
 
 @st.cache_data(show_spinner=False)
 def load_csv(data: bytes):
-    import io
     return pd.read_csv(io.BytesIO(data))
+
+
+@st.cache_data(show_spinner=False)
+def cached_profile(data: bytes):
+    """Profile once per uploaded file instead of on every Streamlit rerun."""
+    return profile_dataframe(load_csv(data))
+
+
+def column_profile(df, cols, n):
+    """Per-column profile table: type, nulls, distinct, range, top value, outliers."""
+    rows = []
+    for c in df.columns:
+        s = df[c]
+        info = cols.get(c, {})
+        row = {
+            "Column": c,
+            "Type": str(s.dtype),
+            "Missing %": round(s.isna().mean() * 100, 2),
+            "Hidden/invalid %": round((info.get("hidden_nulls", 0) + info.get("invalid_zeros", 0)
+                                       + info.get("bad_numeric_text", 0)) / n * 100, 2),
+            "Label variants %": round((info.get("nonstandard_rows", 0) + info.get("review_rows", 0)) / n * 100, 2),
+            "Distinct": int(s.nunique(dropna=True)),
+            "Min": None, "Max": None, "Outliers (IQR)": None,
+            "Top value": None,
+        }
+        if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
+            row["Min"], row["Max"] = s.min(), s.max()
+            q1, q3 = s.quantile(.25), s.quantile(.75)
+            iqr = q3 - q1
+            row["Outliers (IQR)"] = int(((s < q1 - 1.5 * iqr) | (s > q3 + 1.5 * iqr)).sum()) if iqr > 0 else 0
+        else:
+            vc = s.value_counts(dropna=True)
+            if len(vc):
+                row["Top value"] = f"{vc.index[0]} ({vc.iloc[0]:,})"
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    for c in ("Min", "Max"):
+        out[c] = out[c].astype("float64")
+    return out
+
+
+def report_html(md_text, title):
+    body = md_lib.markdown(md_text, extensions=["tables", "fenced_code"]) if HAS_MARKDOWN else f"<pre>{md_text}</pre>"
+    return (f"<!doctype html><html><head><meta charset='utf-8'><title>{title}</title>"
+            "<style>body{font-family:Segoe UI,Arial,sans-serif;max-width:900px;margin:40px auto;color:#222;line-height:1.55}"
+            "h1,h2,h3{color:#8a6d1a}code,pre{background:#f4f1e6;padding:2px 6px;border-radius:4px}"
+            "pre{padding:12px;overflow:auto}table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:4px 8px}"
+            f"</style></head><body>{body}</body></html>")
 
 
 # ======================================================================
@@ -216,7 +270,6 @@ def load_csv(data: bytes):
 page_header("📋", "AI DATA QUALITY & ROOT-CAUSE COPILOT",
             "Upload your dataset and ETL error logs to generate an instant diagnostic and remediation report.")
 
-# File uploader section with unique keys so all uploaders retain state independently
 up1, up2, up3 = st.columns(3)
 with up1:
     uploaded_file = st.file_uploader("Upload Dataset (CSV)", type=["csv"], key="main_dataset")
@@ -225,7 +278,6 @@ with up2:
 with up3:
     baseline_file = st.file_uploader("Baseline CSV (Optional, drift check)", type=["csv"], key="baseline_csv")
 
-# Status indicators for optional files when uploaded independently
 if error_log_file is not None or baseline_file is not None:
     info_msgs = []
     if error_log_file is not None:
@@ -236,16 +288,18 @@ if error_log_file is not None or baseline_file is not None:
         st.info("ℹ️ " + " ".join(info_msgs) + " Please upload your **Dataset (CSV)** in the first box to run the analysis.")
 
 if uploaded_file is not None:
-    df = load_csv(uploaded_file.getvalue())
+    raw = uploaded_file.getvalue()
+    df = load_csv(raw)
     baseline_df = load_csv(baseline_file.getvalue()) if baseline_file is not None else None
     error_logs = error_log_file.getvalue().decode("utf-8", errors="replace") if error_log_file is not None else ""
 
-    # ---------- profiling (hidden nulls, invalid zeros, label variants, outliers) ----------
-    prof = profile_dataframe(df)
+    prof = cached_profile(raw)
     score = prof["score"]
     cols = prof["columns"]
-    hidden_cells = sum(i["hidden_nulls"] + i["invalid_zeros"] + i["nonstandard_rows"] + i["bad_numeric_text"]
-                         for i in cols.values())
+    n = max(prof["rows"], 1)
+    hidden_cells = hidden_total(prof)
+    review_cells = sum(i["review_rows"] for i in cols.values())
+    scale_cols = [c for c, i in cols.items() if i["scale_conflicts"]]
 
     # ---------- KPI cards ----------
     section("🧮", "Data Health Overview")
@@ -265,20 +319,32 @@ if uploaded_file is not None:
          "delta": score["label"], "positive": score["value"] >= 75},
     ])
 
-    # ---------- dataset preview ----------
-    section("📊", "Dataset Preview")
-    st.dataframe(df.head(10), use_container_width=True)
+    if scale_cols:
+        st.warning("⚠️ **Mixed units detected in " + ", ".join(f"`{c}`" for c in scale_cols) + ".** "
+                   + "; ".join(f"'{a}' vs '{b}'" for c in scale_cols for a, b in cols[c]["scale_conflicts"][:2])
+                   + ". These look like different scales, so they are **never merged automatically**.")
+    if review_cells:
+        st.info(f"🔎 {review_cells:,} cells have label variants that need your review before merging (see the review step below).")
+
+    # ---------- explorer ----------
+    section("📊", "Dataset Explorer")
+    tab_prev, tab_prof = st.tabs(["Preview", "Column profile"])
+    with tab_prev:
+        st.dataframe(df.head(10), use_container_width=True)
+    with tab_prof:
+        st.dataframe(column_profile(df, cols, n), use_container_width=True, hide_index=True)
+        st.caption("Outliers use the 1.5×IQR rule. 'Hidden/invalid' = disguised nulls, invalid zeros and non-numeric text.")
 
     # ---------- charts ----------
     section("📈", "Data Quality Insights")
     ch1, ch2 = st.columns([3, 2])
-    n = max(prof["rows"], 1)
     rows = []
     for c, i in cols.items():
         for label, val in (("Missing", i["missing"]),
                            ("Hidden nulls", i["hidden_nulls"] + i["bad_numeric_text"]),
                            ("Invalid zeros", i["invalid_zeros"]),
-                           ("Inconsistent labels", i["nonstandard_rows"])):
+                           ("Label variants (safe)", i["nonstandard_rows"]),
+                           ("Label variants (review)", i["review_rows"])):
             if val:
                 rows.append({"Column": c, "Issue": label, "Affected %": round(val / n * 100, 2)})
     issue_df = pd.DataFrame(rows)
@@ -290,10 +356,15 @@ if uploaded_file is not None:
             fig_issue = px.bar(issue_df, x="Column", y="Affected %", color="Issue",
                                title="Affected Rows by Column and Issue Type (%)",
                                color_discrete_map={"Missing": "#ffd700", "Hidden nulls": "#d4af37",
-                                                   "Invalid zeros": "#f87171", "Inconsistent labels": "#60a5fa"})
+                                                   "Invalid zeros": "#f87171",
+                                                   "Label variants (safe)": "#60a5fa",
+                                                   "Label variants (review)": "#a78bfa"})
             st.plotly_chart(style_fig(fig_issue), use_container_width=True)
         else:
-            st.bar_chart(issue_df.pivot_table(index="Column", columns="Issue", values="Affected %", fill_value=0))
+            st.caption("Affected rows by column and issue type (%). Install `plotly` for the full chart.")
+            st.bar_chart(issue_df.pivot_table(index="Column", columns="Issue", values="Affected %", fill_value=0),
+                         y_label="Affected rows (%)")
+            st.dataframe(issue_df, use_container_width=True, hide_index=True)
 
     with ch2:
         if HAS_PLOTLY:
@@ -318,21 +389,27 @@ if uploaded_file is not None:
 
     # ---------- rule checks ----------
     section("✅", "Data-Quality Rules")
-    st.caption("Auto-generated rules are pre-filled. Edit, add or delete rows to define your own.")
+    seed_rules = default_rules(df, prof)
+    st.caption("Auto-generated rules are pre-filled from your data (completeness, ranges, allowed values). "
+               "Edit, add or delete rows to define your own." if seed_rules else
+               "No rules could be generated automatically. Add your own below.")
     rules_df = st.data_editor(
-        pd.DataFrame(default_rules(df, prof), columns=["column", "op", "value"]),
+        pd.DataFrame(seed_rules, columns=["column", "op", "value"]),
         num_rows="dynamic", use_container_width=True, key=f"rules_{uploaded_file.name}",
         column_config={
             "column": st.column_config.SelectboxColumn("Column", options=list(df.columns)),
             "op": st.column_config.SelectboxColumn("Rule", options=RULE_OPS),
-            "value": st.column_config.TextColumn("Value (e.g. 0 | 1,100 | Low Fat,Regular)"),
+            "value": st.column_config.TextColumn("Value (e.g. 0 | 1,100 | A,B)"),
         })
     rule_list = [r for r in rules_df.fillna("").to_dict("records") if r["column"] and r["op"]]
     rule_results = [evaluate_rule(df, r) for r in rule_list]
     if rule_results:
         res_df = pd.DataFrame(rule_results)[["rule", "status", "failed", "pct", "note"]]
         res_df.columns = ["Rule", "Status", "Failed rows", "Failed %", "Note"]
-        st.dataframe(res_df, use_container_width=True)
+        st.dataframe(res_df, use_container_width=True, hide_index=True)
+        st.download_button("⬇️ Export rules as Great Expectations suite (.json)",
+                           rules_to_great_expectations(rule_list).encode("utf-8"),
+                           file_name="expectation_suite.json", mime="application/json")
 
     st.markdown("---")
 
@@ -341,61 +418,111 @@ if uploaded_file is not None:
                baseline_file.name if baseline_file else None)
     if st.button("🚀 Run AI Root-Cause Analysis & Copilot"):
         with st.spinner("🤖 AI Copilot is profiling data, checking rules and analyzing ETL logs..."):
-            drift = detect_drift(df, baseline_df)
-            logs = analyze_logs(error_logs, df.columns)
             plan = build_plan(df, prof)
-            cleaned = apply_plan(df, plan)
-            prof_after = profile_dataframe(cleaned)
-            st.session_state["result"] = {
+            st.session_state["analysis"] = {
                 "key": run_key,
-                "report": build_report(prof, rule_results, drift, logs, plan),
-                "cleaned_csv": cleaned.to_csv(index=False).encode("utf-8"),
-                "score_after": prof_after["score"],
-                "missing_after": prof_after["missing_cells"],
-                "hidden_after": sum(i["hidden_nulls"] + i["invalid_zeros"] + i["nonstandard_rows"]
-                                    + i["bad_numeric_text"] for i in prof_after["columns"].values()),
+                "drift": detect_drift(df, baseline_df),
+                "logs": analyze_logs(error_logs, df.columns),
+                "plan": plan,
+                "steps": plan_steps(plan, prof),
+                "rules": rule_results,
                 "chat": [],
-                "ctx": {"profile": {k: prof[k] for k in ("rows", "columns_count", "duplicates", "score", "columns")},
-                        "rules": rule_results, "drift": drift, "logs": logs, "plan": plan},
             }
+            st.session_state.pop("applied", None)
 
-    res = st.session_state.get("result")
-    if res and res["key"] == run_key:
+    an = st.session_state.get("analysis")
+    if an and an["key"] == run_key:
         st.markdown(
             '<div class="report-head"><div class="ri">🧠</div><div>'
             '<div class="rt">AI Diagnostic & Remediation Report</div>'
             f'<div class="rs">Generated for {uploaded_file.name}</div></div></div>',
             unsafe_allow_html=True)
 
-        # before / after
-        b1, b2, b3 = st.columns(3)
-        b1.metric("Quality score", f"{res['score_after']['value']} / 100",
-                  f"{res['score_after']['value'] - score['value']:+.1f} after cleaning")
-        b2.metric("Missing cells", f"{res['missing_after']:,}",
-                  f"{res['missing_after'] - prof['missing_cells']:+,} after cleaning", delta_color="inverse")
-        b3.metric("Hidden / invalid cells", f"{res['hidden_after']:,}",
-                  f"{res['hidden_after'] - hidden_cells:+,} after cleaning", delta_color="inverse")
-        st.markdown(res["report"])
+        # ---------- cleaning review: approve each fix ----------
+        section("🛠️", "Review cleaning fixes before applying")
+        st.caption("Tick the fixes you approve. Risky ones (merging possible label variants, capping outliers) "
+                   "are off by default. Nothing is changed in your original file.")
+        steps = an["steps"]
+        if steps:
+            steps_df = pd.DataFrame([{"Apply": s["default"], "Fix": s["fix"], "Column": s["column"],
+                                      "What changes": s["detail"], "Rows": s["rows"]} for s in steps])
+            edited = st.data_editor(
+                steps_df, hide_index=True, use_container_width=True, key=f"steps_{an['key']}",
+                disabled=["Fix", "Column", "What changes", "Rows"],
+                column_config={"Apply": st.column_config.CheckboxColumn("Apply", default=False)})
+            approved = [steps[i]["id"] for i, ok in enumerate(edited["Apply"].tolist()) if ok]
+        else:
+            st.success("No fixes are needed.")
+            approved = []
 
-        d1, d2, _ = st.columns([1, 1, 2])
-        d1.download_button("⬇️ Download report (.md)", res["report"].encode("utf-8"),
+        approved_key = (an["key"], tuple(approved))
+        if st.session_state.get("applied", {}).get("key") != approved_key:
+            applied_plan = filter_plan(an["plan"], approved)
+            cleaned = apply_plan(df, applied_plan)
+            prof_after = profile_dataframe(cleaned)
+            st.session_state["applied"] = {
+                "key": approved_key, "plan": applied_plan,
+                "cleaned_csv": cleaned.to_csv(index=False).encode("utf-8"),
+                "prof_after": prof_after,
+                "rows_after": len(cleaned),
+            }
+        ap = st.session_state["applied"]
+        prof_after = ap["prof_after"]
+
+        # before -> after
+        s_before, s_after = score["value"], prof_after["score"]["value"]
+        m_before, m_after = prof["missing_cells"], prof_after["missing_cells"]
+        h_before, h_after = hidden_cells, hidden_total(prof_after)
+
+        def delta_txt(before, after, fmt="{:,}"):
+            return "no change" if before == after else f"{fmt.format(before)} → {fmt.format(after)}"
+
+        b1, b2, b3 = st.columns(3)
+        b1.metric("Quality score", f"{s_after} / 100", delta_txt(s_before, s_after, "{:.1f}"),
+                  delta_color="off" if s_before == s_after else "normal")
+        b2.metric("Missing cells", f"{m_after:,}", delta_txt(m_before, m_after),
+                  delta_color="off" if m_before == m_after else "inverse")
+        b3.metric("Hidden / invalid cells", f"{h_after:,}", delta_txt(h_before, h_after),
+                  delta_color="off" if h_before == h_after else "inverse")
+        if ap["rows_after"] != prof["rows"]:
+            st.caption(f"Rows: {prof['rows']:,} → {ap['rows_after']:,} (duplicates removed).")
+
+        # ---------- report ----------
+        report = build_report(prof, an["rules"], an["drift"], an["logs"], an["plan"], ap["plan"])
+        st.markdown(report)
+
+        d1, d2, d3, _ = st.columns([1, 1, 1, 1])
+        d1.download_button("⬇️ Report (.md)", report.encode("utf-8"),
                            file_name="data_quality_report.md", mime="text/markdown")
-        d2.download_button("⬇️ Download cleaned CSV", res["cleaned_csv"],
+        d2.download_button("⬇️ Report (.html)",
+                           report_html(report, f"Data quality report - {uploaded_file.name}").encode("utf-8"),
+                           file_name="data_quality_report.html", mime="text/html")
+        d3.download_button("⬇️ Cleaned CSV", ap["cleaned_csv"],
                            file_name="cleaned_" + uploaded_file.name, mime="text/csv")
 
         # ---------- interactive copilot ----------
         section("💬", "Ask the Copilot")
         st.caption("Ask about any column, the score, the logs, or request SQL/Python fixes. "
                    "Uses Gemini (GEMINI_API_KEY in .env) or Hugging Face when a key is set; only statistics are sent, never raw rows.")
-        for m in res["chat"]:
+        for m in an["chat"]:
             with st.chat_message(m["role"]):
                 st.markdown(m["content"])
-        q = st.chat_input("e.g. Why is Outlet_Size missing? How do I fix Item_Fat_Content in SQL?")
+
+        problem_cols = [c for c, i in cols.items()
+                        if i["missing"] or i["hidden_nulls"] or i["invalid_zeros"] or i["nonstandard_rows"]
+                        or i["review_rows"] or i["scale_conflicts"]]
+        c_a = problem_cols[0] if problem_cols else df.columns[0]
+        c_b = problem_cols[1] if len(problem_cols) > 1 else df.columns[min(1, len(df.columns) - 1)]
+        q = st.chat_input(f"e.g. Why does {c_a} have issues? How do I fix {c_b} in SQL?")
         if q:
+            ctx = {"profile": {k: prof[k] for k in ("rows", "columns_count", "duplicates", "score", "columns")},
+                   "rules": an["rules"], "drift": an["drift"], "logs": an["logs"], "plan": ap["plan"],
+                   "steps": [{"fix": s["fix"], "column": s["column"], "what": s["detail"], "rows": s["rows"],
+                              "approved": s["id"] in approved} for s in steps]}
             with st.chat_message("user"):
                 st.markdown(q)
-            reply, engine = ask_copilot(q, res["ctx"], res["chat"])
-            res["chat"] += [{"role": "user", "content": q}, {"role": "assistant", "content": reply}]
+            reply, engine = ask_copilot(q, ctx, an["chat"])
+            an["chat"] += [{"role": "user", "content": q}, {"role": "assistant", "content": reply}]
             with st.chat_message("assistant"):
                 st.markdown(reply)
                 st.caption(f"answered by: {engine}")
