@@ -1,7 +1,22 @@
 import pandas as pd
+import os
 
 def profile_dataset(file_path_or_buffer):
+    # Get file name safely from buffer or string path
+    file_name = "dataset"
+    if hasattr(file_path_or_buffer, 'name'):
+        file_name = os.path.splitext(os.path.basename(file_path_or_buffer.name))[0]
+    elif isinstance(file_path_or_buffer, str):
+        file_name = os.path.splitext(os.path.basename(file_path_or_buffer))[0]
+
     df = pd.read_csv(file_path_or_buffer)
+    
+    # Automatically rename 'Unnamed' columns using the file name prefix
+    df.columns = [
+        f"{file_name}_col_{i}" if str(col).startswith('Unnamed') else col 
+        for i, col in enumerate(df.columns)
+    ]
+    
     total_rows = len(df)
     total_columns = len(df.columns)
     missing_values = df.isnull().sum().to_dict()
