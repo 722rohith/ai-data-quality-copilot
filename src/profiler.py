@@ -3,7 +3,7 @@ import pandas as pd
 def profile_dataset(file_path_or_buffer):
     df = pd.read_csv(file_path_or_buffer)
     
-    # 🛠️ Automatically drop completely empty columns (like Unnamed trailing columns)
+    # 🛠️ Automatically drop completely empty columns (like trailing 'Unnamed' columns)
     df = df.dropna(how='all', axis=1)
     
     total_rows = len(df)
